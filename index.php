@@ -2,7 +2,9 @@
 declare(strict_types=1);
 
 /* ----------------------------------------------------------
-   CONFIG MySQL
+   CONFIGURACIÓN DE BASES DE DATOS
+   MySQL → NemoQ
+   Oracle → OGS / Clínico
 ---------------------------------------------------------- */
 $MYSQL = [
     'host'     => '172.18.8.34',
@@ -13,9 +15,6 @@ $MYSQL = [
     'charset'  => 'utf8mb4',
 ];
 
-/* ----------------------------------------------------------
-   CONFIG ORACLE
----------------------------------------------------------- */
 $ORACLE = [
     'host'     => '172.31.254.85',
     'port'     => 1521,
@@ -24,16 +23,25 @@ $ORACLE = [
     'password' => 'qS4H5iPlmg@Z'
 ];
 
-function h($v): string { return htmlspecialchars((string)$v, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
+// Función para limpiar contenido HTML
+function h($v): string { return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); }
 
 /* ----------------------------------------------------------
-   PARÁMETROS UI
+   PARÁMETROS RECIBIDOS DEL FORMULARIO
 ---------------------------------------------------------- */
+
+// Filtro de estado OGS (NemoQ) → En espera / Llamado / Rellamado
+$estado_ogs = isset($_GET['estado_ogs']) ? (int)$_GET['estado_ogs'] : 1;
+
+// Límite de filas a mostrar
 $limit = isset($_GET['limit']) ? max(1, min(5000, (int)$_GET['limit'])) : 200;
+
+// Tiempo de auto-refresh de la página
 $autorefresh = isset($_GET['refresh']) ? max(0, min(3600, (int)$_GET['refresh'])) : 0;
 
 /* ----------------------------------------------------------
-   CONSULTA MySQL ORIGINAL
+   CONSULTA MySQL (se obtienen tickets impresos desde kiosco)
+   → Se filtra además por estado (1, 3, 4)
 ---------------------------------------------------------- */
 $sql_mysql = "
 SELECT
@@ -57,63 +65,45 @@ SELECT
     bt.agenda,
     bt.printedfrom,
 
-    -- Impreso por (kiosco / mostrador / integración)
+    -- Quién imprimió el ticket
     CASE
-        WHEN SUBSTRING_INDEX(COALESCE(bt.printedfrom, ''), ':', 1) LIKE '172.31.148.%'
-            THEN 'Kiosco'
-        WHEN SUBSTRING_INDEX(COALESCE(bt.printedfrom, ''), ':', 1) LIKE '172.31.131.%'
-            THEN 'Mostrador'
+        WHEN SUBSTRING_INDEX(COALESCE(bt.printedfrom, ''), ':', 1) LIKE '172.31.148.%' THEN 'Kiosco'
+        WHEN SUBSTRING_INDEX(COALESCE(bt.printedfrom, ''), ':', 1) LIKE '172.31.131.%' THEN 'Mostrador'
         ELSE 'Integracion'
     END AS ImpresoPor,
 
-    -- Descripción del estado
+    -- Descripción del estado NemoQ
     CASE bt.status
-        WHEN 0  THEN 'No impreso'
-        WHEN 1  THEN 'En espera'
-        WHEN 2  THEN 'En tránsito'
-        WHEN 3  THEN 'Llamado'
-        WHEN 4  THEN 'Rellamado'
-        WHEN 5  THEN 'Reenviado'
-        WHEN 6  THEN 'Finalizado'
-        WHEN 7  THEN 'No presentado'
-        WHEN 8  THEN 'Reenviado a SE'
-        WHEN 9  THEN 'Llamar a R.S.E.'
-        WHEN 10 THEN 'Admitido'
-        WHEN 11 THEN 'Devuelto'
-        WHEN 12 THEN 'Episodio Eliminado'
-        WHEN 13 THEN 'Reenviado a RAD'
-        WHEN 14 THEN 'Prueba RAD finalizada'
-        WHEN 15 THEN 'Triado'
-        ELSE 'Desconocido'
+        WHEN 1 THEN 'En espera'
+        WHEN 3 THEN 'Llamado'
+        WHEN 4 THEN 'Rellamado'
+        ELSE 'Otros'
     END AS status_descripcion,
 
-    -- Datos del ticket
-    t.id        AS ticket_id,
-    t.number    AS ticket_number,
-    t.status    AS ticket_status,
+    t.id,
+    t.number,
+    t.status,
     t.datum_status,
 
-    -- Tiempo de espera en minutos
+    -- Minutos de espera desde que cambió el estado
     TIMESTAMPDIFF(MINUTE, t.datum_status, NOW()) AS minutos_espera
 
 FROM booked_today bt
-
-LEFT JOIN ticket t
-       ON t.idbooked = bt.id
-      AND t.status = 1
+LEFT JOIN ticket t ON t.idbooked = bt.id AND t.status = 1
 
 WHERE bt.printedfrom LIKE '172.31.148.%'
   AND bt.idcenter IN (4,6)
   AND bt.printed = 1
+  AND bt.status = $estado_ogs   -- ← filtro de estado
 
 ORDER BY minutos_espera DESC
 LIMIT $limit";
 
+// Activar errores MySQL
 mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
 
 /* ----------------------------------------------------------
-                            ORDER BY minutos_espera DESC
-   EJECUTAR MySQL
+   EJECUTAR CONSULTA MySQL
 ---------------------------------------------------------- */
 try {
     $m = new mysqli();
@@ -130,7 +120,7 @@ try {
 }
 
 /* ----------------------------------------------------------
-   CONEXIÓN ORACLE
+   CONEXIÓN A ORACLE
 ---------------------------------------------------------- */
 $connStr = "
 (DESCRIPTION=
@@ -146,6 +136,7 @@ if (!$ora) {
 
 /* ----------------------------------------------------------
    CONSULTA ORACLE
+   → Obtiene estado del acto clínico (PROGRAMADO, etc.)
 ---------------------------------------------------------- */
 $sql_oracle = "
 SELECT 
@@ -158,35 +149,37 @@ SELECT
         ELSE 'OTRO'
     END AS estado
 FROM com_clinical_acts     cca
-JOIN com_subencounters     cs ON cs.sid       = cca.subencounter
-JOIN com_encounters        ce ON ce.sid       = cs.encounter
-JOIN arc_histories         ah ON ah.sid       = ce.history
-LEFT JOIN sch_consultations sc ON sc.sid     = cca.sid
+JOIN com_subencounters     cs ON cs.sid = cca.subencounter
+JOIN com_encounters        ce ON ce.sid = cs.encounter
+JOIN arc_histories         ah ON ah.sid = ce.history
+LEFT JOIN sch_consultations sc ON sc.sid = cca.sid
 WHERE cca.sid = :cca_sid";
 
 $ora_stmt = oci_parse($ora, $sql_oracle);
 
 /* ----------------------------------------------------------
-   PROCESO: Comparar MySQL vs Oracle + Filtrar PROGRAMADO
+   PROCESAR RESULTADOS:
+   → Cruza datos MySQL con Oracle
+   → Solo deja PROGRAMADO
 ---------------------------------------------------------- */
 $result_rows = [];
 
 foreach ($mysql_rows as $row) {
 
-    // ICU → quitar prefijo SF
+    // Convertir ICU (SFxxxx) → SID numérico
     $icu = trim($row['icu']);
     $cca_sid = preg_replace('/^SF/i', '', $icu);
     if (!ctype_digit($cca_sid)) continue;
 
-    // Ejecutar Oracle
+    // Obtener estado desde Oracle
     oci_bind_by_name($ora_stmt, ":cca_sid", $cca_sid);
     oci_execute($ora_stmt);
     $ora_row = oci_fetch_assoc($ora_stmt);
 
     if (!$ora_row) continue;
 
-    // Solo dejamos PROGRAMADO
-   if ($ora_row['ESTADO'] === 'PROGRAMADO') {
+    // Solo mostrar PROGRAMADO
+    if ($ora_row['ESTADO'] === 'PROGRAMADO') {
         $row['estado_oracle'] = 'PROGRAMADO';
         $result_rows[] = $row;
     }
@@ -199,7 +192,6 @@ $count = count($result_rows);
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-
 <title>Lista de Espera</title>
 
 <?php if ($autorefresh > 0): ?>
@@ -212,16 +204,37 @@ $count = count($result_rows);
 <body>
 
 <header>
-    <h1>Lista de Esperaa</h1>
+    <h1>Lista de Espera</h1>
+
+    <!-- FORMULARIO SUPERIOR DE FILTROS -->
     <div class="actions">
-      <form method="get" style="display:flex; gap:8px; align-items:center">
+      <form method="get" style="display:flex; gap:10px; align-items:center">
+
+        <!-- Selector de estado visual -->
+        <label class="muted">Estado OGS</label>
+        <select name="estado_ogs"
+                style="padding:8px 10px; border-radius:8px;
+                       border:1px solid rgba(148,163,184,.45);
+                       background:#11192c; color:var(--text);
+                       min-width:150px;">
+            <option value="1" <?= $estado_ogs == 1 ? 'selected' : '' ?>>En espera</option>
+            <option value="3" <?= $estado_ogs == 3 ? 'selected' : '' ?>>Llamado</option>
+            <option value="4" <?= $estado_ogs == 4 ? 'selected' : '' ?>>Rellamado</option>
+        </select>
+
+        <!-- Límite -->
         <label class="muted">Límite</label>
         <input type="number" name="limit" value="<?= h($limit) ?>" min="1" max="5000"
-               style="width:90px; padding:6px 8px; border-radius:8px; border:1px solid rgba(148,163,184,.25); background:#0b1220; color:var(--text)">
+               style="width:90px; padding:6px 8px; border-radius:8px;
+                      border:1px solid rgba(148,163,184,.25);
+                      background:#0b1220; color:var(--text)">
 
+        <!-- Auto refresh -->
         <label class="muted">Auto-refresh (s)</label>
         <input type="number" name="refresh" value="<?= h($autorefresh) ?>" min="0" max="3600"
-               style="width:110px; padding:6px 8px; border-radius:8px; border:1px solid rgba(148,163,184,.25); background:#0b1220; color:var(--text)">
+               style="width:110px; padding:6px 8px; border-radius:8px;
+                      border:1px solid rgba(148,163,184,.25);
+                      background:#0b1220; color:var(--text)">
 
         <button class="btn" type="submit">Aplicar</button>
         <a class="btn" href="?">Reset</a>
@@ -230,10 +243,13 @@ $count = count($result_rows);
 </header>
 
 <main>
+
+    <!-- Contador de resultados -->
     <div class="toolbar">
       <div class="meta">Mostrando <strong><?=h($count)?></strong> filas</div>
     </div>
 
+    <!-- TABLA DE DATOS -->
     <div class="table-wrap">
       <table>
         <thead>
@@ -258,8 +274,12 @@ $count = count($result_rows);
           </tr>
         </thead>
         <tbody>
+
+          <!-- Si no hay resultados -->
           <?php if (!$result_rows): ?>
             <tr><td colspan="20" class="muted">Sin resultados</td></tr>
+
+          <!-- Resultados -->
           <?php else: ?>
             <?php foreach ($result_rows as $r): ?>
               <tr>
@@ -275,14 +295,20 @@ $count = count($result_rows);
                 <td><?=h($r['dni'])?></td>
                 <td><?=h($r['nhc'])?></td>
                 <td><?=h($r['waitingarea'])?></td>
+
+                <!-- Estado original NemoQ -->
                 <td><?=h($r['status_descripcion'])?></td>
+
                 <td><?=h($r['agenda'])?></td>
                 <td><?=h($r['ImpresoPor'])?></td>
                 <td><?=h($r['minutos_espera'])?> min</td>
+
+                <!-- Estado final Oracle -->
                 <td><span class="pill warn">PROGRAMADO</span></td>
               </tr>
             <?php endforeach; ?>
           <?php endif; ?>
+
         </tbody>
       </table>
     </div>
