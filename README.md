@@ -18,7 +18,6 @@ Es una herramienta útil para supervisión asistencial y monitorización de agen
 ###  Extracción desde MySQL  
 - Consulta sobre la tabla `booked_today` con unión a `ticket`.
 - Filtrado por:
-  - `printedfrom` dentro del rango `172.31.148.%` (kioscos)
   - Centro `4` 
   - Registros impresos (`printed = 1`)
 - Cálculo adicional:
