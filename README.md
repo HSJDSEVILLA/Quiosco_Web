@@ -1,4 +1,4 @@
-# Lista de Espera — Dashboard MySQL + Oracle  
+# Lista de Espera — Comparació MySQL + Oracle  
 Visualizador web para pacientes con estado **PROGRAMADO**
 
 ## Descripción
